@@ -1,0 +1,961 @@
+---
+output:
+  pdf_document: default
+  rticles::ctex: default
+  html_document:
+    df_print: paged
+  word_document: default
+  bookdown::word_document2:
+    fig_caption: true
+    keep_tex: yes
+indent: yes
+link-citations: yes
+editor_options:
+  markdown:
+    wrap: 72
+header-includes:
+- \usepackage{setspace}
+- \doublespacing
+- \setlength{\parindent}{1cm}
+- \usepackage{indentfirst}
+- \usepackage{float}
+- \floatplacement{figure}{H}
+- \usepackage{placeins}
+- \usepackage{pdflscape}
+- \usepackage{caption}
+always_allow_html: yes
+---
+
+
+```{r setup, include=FALSE}
+#https://www.rdocumentation.org/packages/bigrquery/versions/0.4.1
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dslabs)
+library(dplyr)
+library(tidyverse)
+library(bigrquery)
+library(readr)
+library(httpuv)
+library(odbc)
+library(sqldf)
+library(distill)
+library(DBI)
+library(comorbidity)
+library(tableone)
+library(dbplyr)
+library(RPostgres)
+library(reshape)
+library(xgboost)
+library(bayestestR)
+library(weathermetrics)
+library(ggthemes)
+library(stargazer)
+library(pROC)
+library(caret)
+library(xfun)
+library(knitr)
+library(kableExtra)
+library(tinytex)
+library(rticles)
+library(nephro)
+library(stringr)
+library(xtable)
+library(rmarkdown)
+library(modelsummary)
+library(bookdown)
+library(scales)
+library(glue)
+library(extrafont)
+library(latex2exp)
+library(DiagrammeR)
+library(labelled)
+library(DescTools)
+library(MASS)
+library(finalfit)
+library(DiagrammeRsvg)
+library(rsvg)
+library(ggpubr)
+library(Rcpp)
+
+select <- dplyr::select
+extrafont::loadfonts(device="win")
+
+options(scipen = 20)
+
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "INSERT_PHYSIONET_PROJECTNAME",
+  dataset = "physionet-data.mimiciii_clinical.chartevents",
+  )
+
+minduration <- 48
+LDHlimit <- 1000
+LDHlimit_high <- 1500
+LDHlimit_valid <- 1000
+mainrange <- 1000
+GFRlimit <- 30
+labinterval <- 48
+
+
+linearCI1 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(",summarize_regression,"$coefficients[",row,",1], digits = 3)", sep = ""))
+}
+
+linearCI2 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(confint(",raw_regression,")[",row,",1], digits = 3)", sep = ""))}
+
+linearCI3 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(confint(",raw_regression,")[",row,",2], digits = 3)", sep = ""))}
+
+linearCI4 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(",summarize_regression,"$coefficients[",row,",4], digits = 3)", sep = ""))
+}
+
+
+linearCI <- function(summarize_regression,raw_regression,row) {
+  paste("(estimate ", eval(linearCI1(summarize_regression,raw_regression,row)),", 95% CI [", eval(linearCI2(summarize_regression,raw_regression,row)), ", ", eval(linearCI3(summarize_regression,raw_regression,row)),"],",ifelse(eval(linearCI4(summarize_regression,raw_regression,row)) >= 0.001, paste(" p = ", eval(linearCI4(summarize_regression,raw_regression,row)))," p < 0.001"),")", sep = "")
+}
+
+
+
+
+
+
+
+
+
+logisticCI1 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(exp(",summarize_regression,"$coefficients[",row,",1]), digits = 3)", sep = ""))
+}
+
+logisticCI2 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(exp(confint(",raw_regression,")[",row,",1]), digits = 3)", sep = ""))}
+
+
+logisticCI3 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(exp(confint(",raw_regression,")[",row,",2]), digits = 3)", sep = ""))}
+
+
+logisticCI4 <- function(summarize_regression,raw_regression,row) {
+  parse(text=paste("round_tidy(",summarize_regression,"$coefficients[",row,",4], digits = 3)", sep = ""))}
+
+
+
+logisticCI <- function(summarize_regression,raw_regression,row) {
+  paste("(OR ", eval(logisticCI1(summarize_regression,raw_regression,row)),", 95% CI [", eval(logisticCI2(summarize_regression,raw_regression,row)), ", ", eval(logisticCI3(summarize_regression,raw_regression,row)),"],",ifelse(eval(logisticCI4(summarize_regression,raw_regression,row)) >= 0.001, paste(" p = ", eval(logisticCI4(summarize_regression,raw_regression,row)))," p < 0.001"),")",sep = "")
+}
+
+
+```
+
+```{sql, connection=con, output.var = "sql_hadmid",echo = FALSE}
+
+SELECT DISTINCT hadm_id FROM `physionet-data.mimic_icu.chartevents` WHERE itemid = 224191
+```
+
+```{sql, connection=con, output.var = "sql_fluidremoval",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE itemid = 224191 ORDER BY hadm_id
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+last_CRRT_time <- sql_fluidremoval %>% group_by(hadm_id) %>% filter(charttime == max(charttime)) %>% select(hadm_id, charttime)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+# Select patients based on 48-hour algorithms
+timecomptable <- sql_fluidremoval %>% arrange(hadm_id, charttime) %>% mutate(rownum = row_number()) %>% mutate(timediff = as.numeric(difftime((as.POSIXlt(charttime,format='%m/%d/%Y %H:%M')),(lag(charttime,n=1)),units="hours")))
+
+timecomptable_starts <- filter(timecomptable, as.numeric(difftime((as.POSIXlt(timecomptable$charttime,format='%m/%d/%Y  %H:%M')),(as.POSIXlt(lag(timecomptable$charttime,n=1),format='%m/%d/%Y %H:%M')),units="hours"))>2 | !timecomptable$hadm_id == lag(timecomptable$hadm_id,n=1)) 
+
+timecomptable_starts_ends <- mutate(timecomptable_starts, endtime = timecomptable$charttime[lead(timecomptable_starts$rownum, n=1)-1])
+
+timecomptable_starts_ends_sp <- arrange(timecomptable_starts_ends, hadm_id) %>%
+  
+  mutate(hadmid_comparator = timecomptable$hadm_id[lead(timecomptable_starts$rownum, n =1)-1], hadm_id == hadmid_comparator)
+
+
+
+timecomptable_starts_ends_sp_48 <- filter(timecomptable_starts_ends_sp,difftime((as.POSIXlt(endtime,format='%m/%d/%Y %H:%M')),(as.POSIXlt(charttime,format='%m/%d/%Y %H:%M')),units="hours")>=minduration) %>% group_by(hadm_id) %>%
+
+
+  mutate(duration =difftime((as.POSIXlt(endtime,format='%m/%d/%Y %H:%M')),(as.POSIXlt(charttime,format='%m/%d/%Y %H:%M')),units="hours"))%>% group_by(hadm_id) %>% summarize(CRRTstarttime = min(charttime), CRRTendtime = min(endtime), duration = difftime(CRRTendtime, CRRTstarttime, units = "hours"))
+
+CRRTstarttable <- select(timecomptable_starts_ends_sp_48, hadm_id, CRRTendtime, CRRTstarttime) %>% mutate(duration = difftime(CRRTendtime, CRRTstarttime, units = "hours"))
+
+```
+
+```{sql, connection=con, output.var = "allmimicpatients",echo = FALSE}
+SELECT DISTINCT subject_id, hadm_id  FROM `physionet-data.mimic_core.admissions`
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+hadmidlist <- as.vector(sql_hadmid$hadm_id)
+hadmidlistSQL <- glue::glue_sql("{hadmidlist*}", .con = con2)
+```
+
+```{sql, connection=con, output.var = "MAPtable1",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND (itemid = 220181) ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "MAPtable2",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND (itemid = 225312) ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "MAPtable3",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND (itemid = 220052) ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "SBPtable",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND (itemid = 220179 OR itemid = 220050 OR itemid = 225309) ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "DBPtable",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND (itemid = 220180 OR itemid = 220051 OR itemid = 225310) ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "temptableF",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 223761 ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "temptableC",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 223762 ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "heartratetable",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 220045 ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "O2sat",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 220227 ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "Resp",echo = FALSE}
+SELECT hadm_id, charttime, valuenum FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 220210 ORDER BY hadm_id, charttime 
+```
+
+```{sql, connection=con, output.var = "replacementfluidrate",echo = FALSE}
+SELECT hadm_id, charttime, valuenum, valueuom FROM `physionet-data.mimic_icu.chartevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 224153 ORDER BY hadm_id, charttime
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+# Temperature data, filtered for CRRT periods
+names(temptableF)[names(temptableF) == "valuenum"] = "temp"
+names(temptableC)[names(temptableC) == "valuenum"] = "temp"
+
+temptableF_comp <- left_join(temptableF, CRRTstarttable, by = "hadm_id")%>% filter(charttime >= CRRTstarttime, charttime <= CRRTendtime)%>% group_by(hadm_id)  %>% summarize(maxtemp = fahrenheit.to.celsius(max(temp)))
+temptableC_comp <- left_join(temptableC, CRRTstarttable, by = "hadm_id")%>% filter(charttime >= CRRTstarttime, charttime <= CRRTendtime)%>% group_by(hadm_id)  %>% summarize(maxtemp = max(temp)) 
+temptable_comp <- rbind(temptableF_comp,temptableC_comp ) %>% group_by(hadm_id) %>% summarize(maxtemp = max(maxtemp)) %>% filter(maxtemp >25) 
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+# Other vitals, except blood pressure
+names(heartratetable)[names(heartratetable) == "valuenum"] = "heartrate"
+names(Resp)[names(Resp) == "valuenum"] = "resprate"
+names(O2sat)[names(O2sat) == "valuenum"] = "O2sat"
+
+heartrate_comp <- left_join(heartratetable, CRRTstarttable, by = "hadm_id")%>% filter(charttime >= CRRTstarttime, charttime <= CRRTendtime)%>% group_by(hadm_id)  %>% summarize(maxheartrate = max(heartrate), meanheartrate = mean(heartrate)) 
+O2sat_comp <- left_join(O2sat, CRRTstarttable, by = "hadm_id")%>% filter(charttime >= CRRTstarttime, charttime <= CRRTendtime)%>% group_by(hadm_id)  %>% summarize(minO2sat = min(O2sat), meanO2sat = mean(O2sat), maxO2sat = max(O2sat)) 
+resp_comp <- left_join(Resp, CRRTstarttable, by = "hadm_id")%>% filter(charttime >= CRRTstarttime, charttime <= CRRTendtime)%>% group_by(hadm_id)  %>% summarize(meanresprate = mean(resprate), maxresprate = mean(resprate)) 
+
+vitalstable <- left_join(temptable_comp, heartrate_comp, by = "hadm_id") %>% left_join(O2sat_comp, by = "hadm_id")%>% left_join(resp_comp, by = "hadm_id")
+
+```
+
+```{sql, connection=con, output.var = "sql_core",echo = FALSE}
+SELECT subject_id, hadm_id, admittime, dischtime, deathtime, hospital_expire_flag, ethnicity FROM `physionet-data.mimic_core.admissions` WHERE hadm_id IN (?hadmidlistSQL)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+subjectlist <- as.vector(sql_core$subject_id)
+subjectlistSQL <- glue::glue_sql("{subjectlist*}", .con = con2)
+```
+
+```{sql, connection=con, output.var = "sql_patients",echo = FALSE}
+SELECT subject_id, gender, anchor_age, anchor_year, anchor_year_group, dod FROM `physionet-data.mimic_core.patients` WHERE subject_id IN (?subjectlistSQL)
+```
+
+```{sql, connection=con, output.var = "icustays",echo = FALSE}
+SELECT hadm_id, stay_id, intime, outtime FROM `physionet-data.mimic_icu.icustays` WHERE hadm_id IN (?hadmidlistSQL)
+```
+
+```{sql, connection=con, output.var = "UOPcodes",echo = FALSE}
+SELECT DISTINCT itemid FROM `physionet-data.mimic_icu.outputevents` WHERE hadm_id IN (?hadmidlistSQL)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+UOPcodeslist <- UOPcodes$itemid
+UOPcodeslistSQL <- glue::glue_sql("{UOPcodeslist*}", .con = con2)
+```
+
+
+```{sql, connection=con, output.var = "UOP", echo = FALSE}
+SELECT hadm_id, itemid, value, valueuom, charttime FROM `physionet-data.mimic_icu.outputevents` WHERE hadm_id IN (?hadmidlistSQL) AND (itemid = 226559 OR itemid = 226560 OR itemid = 226561 OR itemid = 226563 OR itemid = 226564 OR itemid = 226565 OR itemid = 226567 OR itemid = 226584 OR itemid = 226631)
+```
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+UOPtable <- UOP %>% filter(valueuom == "ml") %>% left_join(CRRTstarttable, by = "hadm_id") %>% filter(charttime > CRRTstarttime, charttime < CRRTendtime) %>% group_by(hadm_id) %>% summarize(totalUOP = sum(value))
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+#Vector to dataframe of all possible labs
+Sodium <- c(Sodium = 50983,Sodium = 52618)
+Potassium <- c(Potassium=50971,Potassium=52605)
+Chloride <- c(Chloride=50902,Chloride=52530)
+Schistocytes <- c(Schistocytes = 51287)
+Reticulocytes <- c(Reticulocytes = 51282)
+Bicarbonate <- c(Bicarbonate=52017,Bicarbonate=50882,Bicarbonate=50803)
+BUN <- c(BUN=51006,BUN=52642)
+Creatinine <- c(Creatinine=50912,Creatinine=52541)
+GFR <- c(GFR=52021, GFR = 50920)
+Calcium <- c(Calcium=50893)
+Magnesium <- c(Magnesium=50960)
+Phosphorus <- c(Phosphorus=50970)
+AST <- c(AST=50878)
+ALT <- c(ALT=50861)
+AlkPhos <- c(AlkPhos=50863)
+TBilirubin <- c(TBilirubin=50885)
+TProtein <- c(TProtein=50976, TProtein=50930)
+Albumin <- c(Albumin=52017,Albumin=51542,Albumin=50862)
+WBC <- c(WBC=51753,WBC=51754,WBC=51301)
+Hemoglobin <- c(Hemoglobin=50811,Hemoglobin=50855,Hemoglobin=51222)
+Hematocrit <- c(Hematocrit=52028,Hematocrit=51638,Hematocrit=51639,Hematocrit=51221)
+Platelets <- c(Platelets=51702,Platelets= 51265)
+Lactate <- c(Lactate=50813,Lactate=52437)
+CRP <- c(CRP=51650,CRP=50889)
+ESR <- c(ESR=51288)
+TropI <- c(TropI=51002,TropI=52637)
+TropT <- c(TropT=51003)
+UricAcid <- c(UricAcid=51007)
+NTproBNP <- c(NTproBNP=50963)
+RDW <- c(RDW=51277)
+CK <- c(CK=50910)
+INR <- c(INR = 51673, INR = 51237)
+AnionGap <- c(AnionGap = 50868, AnionGap = 52495)
+LDH <- c(LDH = 50954)
+BloodpH <- c(BloodpH = 50820)
+UrinepH <- c(UrinepH = 52040, UrinepH = 51094, UrinepH = 52725, UrinepH = 51491)
+pCO2 <- c(pCO2 = 50818)
+pO2 <- c(pO2 = 50821)
+Ferritin <- c(Ferritin = 50924)
+TIBC <- c(TIBC = 50953)
+Iron <- c(Iron = 50952)
+MCV <- c(MCV = 51689, MCV = 51250)
+Haptoglobin <- c(Haptoglobin = 50935)
+Fibrinogen <- c(Fibrinogen = 51621, Fibrinogen = 52111, Fibrinogen = 51214)
+Lipase <- c(Lipase = 50956)
+Ddimer <- c(DDimer = 50915, DDimer = 52546, DDimer = 51196)
+Osmolality <- c(Osmolality = 52026)
+UNa <- c(UNa = 51100, UNa = 52042)
+DBilirubin <- c(DBilirubin = 50883)
+IBilirubin <- c(IBilirubin = 50884)
+LD1 <- c(LD1 = 51678)
+LD2 <- c(LD2 = 51679)
+LD3 <- c(LD3 = 51680)
+LD4 <- c(LD4 = 51681)
+LD5 <- c(LD5 = 51682)
+GGT <- c(GGT = 50927)
+Flu <- c(Flu = 51857, Flu = 51858, Flu = 51859, Flu = 51860, Flu = 51861, Flu = 51862, Flu = 51863, Flu = 51864, Flu = 51865, Flu = 51866, Flu = 51867, Flu = 51868, Flu = 51869)
+Parasite <- c(Parasite = 51150)
+Malaria <- c(Malaria = 52136)
+UrineColor <- c(UrineColor = 51508)
+UrineBlood <- c(UrineBlood = 51466,UrineBlood = 51962 )
+
+labvector = c(Sodium, Potassium, Chloride, Bicarbonate, BUN, Creatinine, Calcium, Magnesium, Phosphorus, AST, ALT, AlkPhos, TBilirubin, TProtein, Albumin, WBC, Hemoglobin, Hematocrit, Platelets, Lactate, CRP, ESR, TropI, TropT, UricAcid, NTproBNP, RDW, CK, INR, AnionGap, LDH, BloodpH, UrinepH, pCO2, pO2, Ferritin, TIBC, Iron, MCV, Haptoglobin, Reticulocytes, Fibrinogen, Lipase, Ddimer, Osmolality, UNa, DBilirubin, IBilirubin, LD1, LD2, LD3, LD4, LD5, GGT, Flu, Parasite, Malaria, UrineColor, UrineBlood, GFR, Reticulocytes)
+
+labdataframe <- enframe(labvector)
+names(labdataframe)[2] = "itemid"
+
+labvectorSQL <- glue::glue_sql("{labvector*}", .con = con2)
+```
+
+```{sql, connection=con, output.var = "labtable",echo = FALSE}
+SELECT  labevent_id, subject_id, hadm_id, itemid, valuenum, valueuom, charttime  FROM `physionet-data.mimic_hosp.labevents`  WHERE itemid IN (?labvectorSQL) AND hadm_id IN (?hadmidlistSQL) ORDER BY itemid 
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+
+# Last creatinine value before discharge
+last_Creatinine <- labtable %>% filter(itemid %in% c(50912, 52541))%>% group_by(hadm_id) %>% filter(charttime == max(charttime)) %>% select(hadm_id, valuenum) %>% summarize(valuenum=mean(valuenum))
+names(last_Creatinine)[names(last_Creatinine) == "valuenum"] = "lastCreatinine"
+
+# Final lab table, labinterval is time between CRRT start and labs, must be less than 48 hours
+labtable_melt <- left_join(labtable, select(CRRTstarttable, hadm_id, CRRTstarttime), by = "hadm_id") %>% mutate(lab_and_start_time = as.numeric(difftime(charttime,CRRTstarttime,units="hours"))) %>% filter(lab_and_start_time<=0, lab_and_start_time >= -labinterval) %>% left_join( labdataframe, by = "itemid") %>% group_by(name,hadm_id) %>% mutate(keep = ifelse(as.numeric(abs(lab_and_start_time)) == min(abs(as.numeric(lab_and_start_time))),1,0)) %>% filter(keep == 1)%>% select(-(keep)) %>% melt(id=c("labevent_id","subject_id", "hadm_id","itemid","valueuom","charttime","CRRTstarttime","lab_and_start_time","name")) %>% cast(hadm_id~name, mean)
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+stayidlist <- c(icustays$stay_id) 
+stayidlistSQL <- glue::glue_sql("{stayidlist*}", .con = con2)
+```
+
+```{sql, connection=con, output.var = "sofa",echo = FALSE}
+SELECT stay_id, sofa_24hours, respiration_24hours, coagulation_24hours, liver_24hours, cardiovascular_24hours, cns_24hours, renal_24hours, starttime FROM `physionet-data.mimic_derived.sofa` WHERE stay_id IN (?stayidlistSQL)
+```
+
+```{sql, connection=con, output.var = "vent_times",echo = FALSE}
+
+SELECT stay_id, starttime, endtime FROM `physionet-data.mimic_derived.ventilation` WHERE stay_id IN (?stayidlistSQL)
+```
+
+```{sql, connection=con, output.var = "weightdata",echo = FALSE}
+SELECT stay_id, starttime, weight FROM `physionet-data.mimic_derived.weight_durations`  WHERE stay_id IN (?stayidlistSQL)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+names(weightdata)[names(weightdata) == "starttime"] <- "weighttime"
+names(sofa)[names(sofa) == "starttime"] <- "sofatime"
+```
+
+```{sql, connection=con, output.var = "ESRD_9",echo = FALSE}
+SELECT subject_id, hadm_id, seq_num, icd_code, icd_version FROM `physionet-data.mimic_hosp.diagnoses_icd` WHERE hadm_id IN (?hadmidlistSQL) AND icd_Version = 9 AND icd_code LIKE '%5856%'
+```
+
+```{sql, connection=con, output.var = "ESRD_10",echo = FALSE}
+SELECT subject_id, hadm_id, seq_num, icd_code, icd_version FROM `physionet-data.mimic_hosp.diagnoses_icd` WHERE hadm_id IN (?hadmidlistSQL) AND icd_Version = 10 AND icd_code LIKE '%N186%'
+```
+
+```{sql, connection=con, output.var = "sql_ICD_10",echo = FALSE}
+SELECT subject_id, hadm_id, seq_num, icd_code, icd_version FROM `physionet-data.mimic_hosp.diagnoses_icd` WHERE hadm_id IN (?hadmidlistSQL) AND icd_Version = 10
+```
+
+```{sql, connection=con, output.var = "sql_ICD_9",echo = FALSE}
+SELECT subject_id, hadm_id, seq_num, icd_code, icd_version FROM `physionet-data.mimic_hosp.diagnoses_icd` WHERE hadm_id IN (?hadmidlistSQL) AND icd_Version = 9
+```
+
+```{sql, connection=con, output.var = "norepi_data",echo = FALSE}
+SELECT hadm_id, starttime,endtime, rate, rateuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 221906
+```
+
+```{sql, connection=con, output.var = "epi_data",echo = FALSE}
+SELECT hadm_id, starttime,endtime, rate, rateuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 221289
+```
+
+```{sql, connection=con, output.var = "Phenylephrine_data",echo = FALSE}
+SELECT hadm_id, starttime,endtime, rate, rateuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 221749
+```
+
+```{sql, connection=con, output.var = "Vasopressin_data",echo = FALSE}
+SELECT hadm_id, starttime,endtime, rate, rateuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 222315
+```
+
+```{sql, connection=con, output.var = "Dopamine_data",echo = FALSE}
+SELECT hadm_id, starttime,endtime, rate, rateuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 221662
+```
+
+```{sql, connection=con, output.var = "Dobutamine_data",echo = FALSE}
+SELECT hadm_id, starttime,endtime, rate, rateuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 221653
+```
+
+```{sql, connection=con, output.var = "Milrinone_data",echo = FALSE}
+SELECT hadm_id, starttime,endtime, rate, rateuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND itemid = 221986
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+
+
+#Changes bounds to CRRT start and end time
+pressor_start_adjusted <- function(starttime, CRRTstarttime) {
+    if ((starttime<=CRRTstarttime)) {
+    return (CRRTstarttime)
+  }
+    else{
+    return (starttime)
+  }
+}
+pressor_end_adjusted <- function(endtime, CRRTendtime) {
+    if ((endtime>=CRRTendtime)) {
+    return (CRRTendtime)
+  }
+    else{
+    return (endtime)
+  }
+}
+
+
+#pressor_start_adjusted <- function(starttime, CRRTstarttime) {
+  #  ifelse(starttime<=as.POSIXct(CRRTstarttime),as.POSIXct(CRRTstarttime),as.POSIXct(starttime))
+ #   }
+
+#pressor_end_adjusted <- function(endtime, CRRTendtime) {
+   # ifelse (endtime>=CRRTendtime,as.POSIXct(CRRTendtime),as.POSIXct(endtime))}
+
+
+#Vasopressors/inotropes
+norepi <- left_join(norepi_data, CRRTstarttable, by = "hadm_id") %>%filter(!is.na(CRRTstarttime))  %>% filter(!(starttime<CRRTstarttime & endtime<CRRTstarttime), !(starttime>CRRTendtime))  %>% group_by(hadm_id, starttime)%>% mutate(adjusted_start = pressor_start_adjusted(starttime, CRRTstarttime), adjusted_end = pressor_end_adjusted(endtime, CRRTendtime))
+
+epi <- left_join(epi_data, CRRTstarttable, by = "hadm_id") %>%filter(!is.na(CRRTstarttime))  %>% filter(!(starttime<CRRTstarttime& endtime<CRRTstarttime), !(starttime>CRRTendtime)) %>% group_by(hadm_id, starttime) %>% mutate(adjusted_start = pressor_start_adjusted(starttime, CRRTstarttime), adjusted_end = pressor_end_adjusted(endtime, CRRTendtime))
+
+Vasopressin <- left_join(Vasopressin_data, CRRTstarttable, by = "hadm_id") %>%filter(!is.na(CRRTstarttime))  %>% filter(!(starttime<CRRTstarttime& endtime<CRRTstarttime), !(starttime>CRRTendtime)) %>% group_by(hadm_id, starttime) %>% mutate(adjusted_start = pressor_start_adjusted(starttime, CRRTstarttime), adjusted_end = pressor_end_adjusted(endtime, CRRTendtime))
+
+Phenylephrine <- left_join(Phenylephrine_data, CRRTstarttable, by = "hadm_id") %>%filter(!is.na(CRRTstarttime))  %>% filter(!(starttime<CRRTstarttime& endtime<CRRTstarttime), !(starttime>CRRTendtime)) %>% group_by(hadm_id, starttime) %>% mutate(adjusted_start = pressor_start_adjusted(starttime, CRRTstarttime), adjusted_end = pressor_end_adjusted(endtime, CRRTendtime)) 
+
+Dopamine <- left_join(Dopamine_data, CRRTstarttable, by = "hadm_id") %>%filter(!is.na(CRRTstarttime))  %>% filter(!(starttime<CRRTstarttime& endtime<CRRTstarttime), !(starttime>CRRTendtime)) %>% group_by(hadm_id, starttime) %>% mutate(adjusted_start = pressor_start_adjusted(starttime, CRRTstarttime), adjusted_end = pressor_end_adjusted(endtime, CRRTendtime)) 
+
+Dobutamine <- left_join(Dobutamine_data, CRRTstarttable, by = "hadm_id") %>%filter(!is.na(CRRTstarttime))  %>% filter(!(starttime<CRRTstarttime& endtime<CRRTstarttime), !(starttime>CRRTendtime)) %>% group_by(hadm_id, starttime) %>% mutate(adjusted_start = pressor_start_adjusted(starttime, CRRTstarttime), adjusted_end = pressor_end_adjusted(endtime, CRRTendtime)) 
+
+Milrinone <- left_join(Milrinone_data, CRRTstarttable, by = "hadm_id") %>%filter(!is.na(CRRTstarttime))  %>% filter(!(starttime<CRRTstarttime& endtime<CRRTstarttime), !(starttime>CRRTendtime)) %>% group_by(hadm_id, starttime) %>% mutate(adjusted_start = pressor_start_adjusted(starttime, CRRTstarttime), adjusted_end = pressor_end_adjusted(endtime, CRRTendtime))
+
+
+
+#Average and max pressor rates
+norepi_data_weighted <- norepi %>% mutate(duration_indiv = difftime(adjusted_end, adjusted_start, units = "mins")) %>% group_by(hadm_id) %>% summarize(max_norepi = max(rate),vasopressorintake = as.numeric(sum(rate*duration_indiv))) %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(avg_norepi = vasopressorintake/(as.numeric(duration*60))) %>%select(hadm_id, avg_norepi, max_norepi) 
+
+epi_data_weighted <- epi %>% mutate(duration_indiv = difftime(adjusted_end, adjusted_start, units = "mins")) %>% group_by(hadm_id) %>% summarize(max_epi = max(rate), vasopressorintake = as.numeric(sum(rate*duration_indiv))) %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(avg_epi = vasopressorintake/as.numeric(duration*60)) %>%select(hadm_id, avg_epi, max_epi) 
+
+Vasopressin_data_weighted <- Vasopressin %>% mutate(duration_indiv = difftime(adjusted_end, adjusted_start, units = "hours")) %>% group_by(hadm_id) %>% summarize(max_Vasopressin = max(rate), vasopressorintake = (sum(rate*as.numeric(duration_indiv)))) %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(avg_Vasopressin = vasopressorintake/as.numeric(duration)) %>%select(hadm_id, avg_Vasopressin, max_Vasopressin) 
+
+Phenylephrine_data_weighted <- Phenylephrine %>% mutate(duration_indiv = difftime(adjusted_end, adjusted_start, units = "mins")) %>% group_by(hadm_id) %>% summarize(max_Phenylephrine = max(rate),vasopressorintake = as.numeric(sum(rate*duration_indiv))) %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(avg_Phenylephrine = vasopressorintake/as.numeric(duration*60)) %>%select(hadm_id, avg_Phenylephrine,max_Phenylephrine) 
+
+Dopamine_data_weighted <- Dopamine %>% mutate(duration_indiv = difftime(adjusted_end, adjusted_start, units = "mins")) %>% group_by(hadm_id) %>% summarize(max_Dopamine = max(rate),vasopressorintake = as.numeric(sum(rate*duration_indiv))) %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(avg_Dopamine = vasopressorintake/as.numeric(duration*60)) %>%select(hadm_id, avg_Dopamine, max_Dopamine) 
+
+Dobutamine_data_weighted <- Dobutamine %>% mutate(duration_indiv = difftime(adjusted_end, adjusted_start, units = "mins")) %>% group_by(hadm_id) %>% summarize(max_Dobutamine = max(rate),vasopressorintake = as.numeric(sum(rate*duration_indiv))) %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(avg_Dobutamine = vasopressorintake/as.numeric(duration*60)) %>%select(hadm_id, avg_Dobutamine, max_Dobutamine) 
+
+Milrinone_data_weighted <- Milrinone %>% mutate(duration_indiv = difftime(adjusted_end, adjusted_start, units = "mins")) %>% group_by(hadm_id) %>% summarize(max_Milrinone = max(rate),vasopressorintake = as.numeric(sum(rate*duration_indiv))) %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(avg_Milrinone = vasopressorintake/as.numeric(duration*60)) %>%select(hadm_id, avg_Milrinone, max_Milrinone) 
+
+patient_table_pressors<- left_join(norepi_data_weighted, epi_data_weighted, by = "hadm_id") %>% left_join(Vasopressin_data_weighted, by = "hadm_id")%>% left_join(Phenylephrine_data_weighted, by = "hadm_id")%>% left_join(Dopamine_data_weighted, by = "hadm_id")%>% left_join(Dobutamine_data_weighted, by = "hadm_id")%>% left_join(Milrinone_data_weighted, by = "hadm_id")
+
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+ESRD_table <- data.frame(rbind(ESRD_9, ESRD_10)) %>% distinct(hadm_id)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+#Elixhauser tables
+elixhauser9 <- comorbidity(x=sql_ICD_9, id="hadm_id", code = "icd_code", score = "elixhauser",icd="icd9", assign0 = FALSE)
+
+elixhauser10 <- comorbidity(x=sql_ICD_10, id="hadm_id", code = "icd_code", score = "elixhauser",icd="icd10", assign0 = FALSE)
+
+icdtable <- data.frame(rbind(elixhauser9, elixhauser10)) 
+```
+
+```{sql, connection=con, output.var = "input_data",echo = FALSE}
+SELECT subject_id, hadm_id, starttime,endtime, itemid, rate, rateuom, amount, amountuom FROM `physionet-data.mimic_icu.inputevents` WHERE hadm_id IN (?hadmidlistSQL) AND (amountuom = "ml" OR amountuom = "L")
+```
+
+```{sql, connection=con, output.var = "output_data",echo = FALSE}
+SELECT subject_id, hadm_id, charttime, itemid, value, valueuom FROM `physionet-data.mimic_icu.outputevents` WHERE hadm_id IN (?hadmidlistSQL)AND (valueuom = "ml" OR valueuom = "L")
+```
+
+```{sql, connection=con, output.var = "broad_spectrum",echo = FALSE}
+SELECT hadm_id, charttime, medication FROM `physionet-data.mimic_hosp.emar` WHERE hadm_id IN (?hadmidlistSQL) AND (medication = "Piperacillin-Tazobactam" or medication = "Cefepime" or medication = "Meropenem" or medication = "Vancomycin" or medication = "Imipenem" or medication = "Levofloxacin" or medication = "Ciprofloxacin" or medication = "Aztreonam" or medication = "Ampicillin" or medication = "Trimethoprim/Sulfamethoxazole"or medication = "Azithromycin")
+```
+
+```{sql, connection=con, output.var = "steroids",echo = FALSE}
+SELECT hadm_id, charttime, medication FROM `physionet-data.mimic_hosp.emar` WHERE hadm_id IN (?hadmidlistSQL) AND (medication = "Hydrocortisone" or medication = "Methylprednisolone" or medication = "Dexamethasone")
+```
+
+```{sql, connection=con, output.var = "Diuretics",echo = FALSE}
+SELECT hadm_id, charttime, medication FROM `physionet-data.mimic_hosp.emar` WHERE hadm_id IN (?hadmidlistSQL) AND (medication = "Furosemide"or medication = "Bumetanide"or medication = "Chlorothiazide")
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+# Find patients on broad spectrum antibiotics or steroids
+broadabxlist <- left_join(CRRTstarttable, broad_spectrum, by = "hadm_id") %>% filter(difftime(CRRTstarttime, charttime, units = "hours")<24)
+steroidslist <- left_join(CRRTstarttable, steroids, by = "hadm_id") %>% filter(difftime(CRRTstarttime, charttime, units = "hours")<24)
+
+# Ultrafiltration records
+UF_summary <- left_join(CRRTstarttable,sql_fluidremoval, by = "hadm_id") %>% arrange(hadm_id, charttime) %>% filter(charttime >=CRRTstarttime & charttime <= CRRTendtime) %>% group_by(hadm_id) %>% summarize(totalUF = sum(valuenum)) 
+
+#Determines end time for replacement fluid rates
+replacementfluid_summary <- left_join(CRRTstarttable,replacementfluidrate, by = "hadm_id") %>%   filter(charttime >=CRRTstarttime & charttime <= CRRTendtime) %>% mutate(endcharttime = ifelse(hadm_id == lead(hadm_id), (lead(charttime)), (CRRTendtime)), charttimenum = as.numeric(charttime), timediff = (endcharttime-charttimenum)/3600) %>% group_by(hadm_id) %>% summarize(replacementfluid_rate = mean(sum(valuenum*timediff))/as.numeric(duration)) %>% unique()
+
+# Get all other outputs
+output_summary <- left_join(CRRTstarttable,output_data, by = "hadm_id") %>% filter(charttime >=CRRTstarttime & charttime <= CRRTendtime) %>% group_by(hadm_id) %>% summarize(totaloutput = sum(value)) 
+
+input_data$amount[input_data$amountuom == "L"] = input_data$amount*1000
+input_data$amountuom[input_data$amountuom == "L"] = "ml"
+
+# Get all inputs
+input_summary <-left_join(CRRTstarttable,input_data, by = "hadm_id")  %>% filter(((starttime >=CRRTstarttime) & (endtime <= CRRTendtime))) %>% group_by(hadm_id) %>% summarize(totalinput = sum(amount))
+
+# Inputs and outputs from prior to starting CRRT
+pre_CRRT_input <- left_join(CRRTstarttable,input_data, by = "hadm_id")  %>% filter(((starttime <=CRRTstarttime) & (endtime <= CRRTstarttime))) %>% group_by(hadm_id) %>% summarize(preCRRTinput = sum(amount))
+pre_CRRT_output <- left_join(CRRTstarttable,output_data, by = "hadm_id")  %>% filter(((charttime <=CRRTstarttime))) %>% group_by(hadm_id) %>% summarize(preCRRToutput = sum(value))
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+sql_hadmid_filtered <- filter(sql_hadmid, hadm_id %in% c(timecomptable_starts_ends_sp_48$hadm_id)) %>% left_join( timecomptable_starts_ends_sp_48, by = "hadm_id")
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+#MAPs
+
+names(MAPtable1)[names(MAPtable1) == "valuenum"] = "MAP"
+names(MAPtable2)[names(MAPtable2) == "valuenum"] = "MAP"
+names(MAPtable3)[names(MAPtable3) == "valuenum"] = "MAP"
+names(SBPtable)[names(SBPtable) == "valuenum"] = "SBP"
+names(DBPtable)[names(DBPtable) == "valuenum"] = "DBP"
+
+
+MAPtable_comp <- rbind(MAPtable1, MAPtable2, MAPtable3) %>% filter(MAP > 0, MAP <300) %>% mutate(charttime2 = as.numeric(charttime)) %>% arrange(by = hadm_id, charttime2) %>% left_join(CRRTstarttable, by = "hadm_id")%>% filter(charttime >= CRRTstarttime, charttime <= CRRTendtime)%>% group_by(hadm_id)  %>%
+  summarize(areaunder = as.numeric(area_under_curve(charttime2,MAP,method="trapezoid")), duration = difftime(max(charttime),min(charttime), units = "secs")) %>% mutate(MAPAUC = areaunder/(as.numeric(duration))) %>% select(-(areaunder), -(duration))
+
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+#Determine if patient was vented at start of CRRT, adds weight data as well
+venttable <- left_join(icustays, vent_times, by = "stay_id") %>% left_join(weightdata, by = "stay_id") %>%left_join(CRRTstarttable, by = "hadm_id") %>% filter(as.numeric(starttime) < as.numeric(CRRTstarttime))%>% group_by(hadm_id)%>%
+  summarize(ventstart = (starttime[which.max(starttime)]),ventend = (endtime[which.max(starttime)]))  %>%left_join(CRRTstarttable, by = "hadm_id") %>% mutate(vented = ifelse(ventstart < CRRTstarttime & ventend >CRRTstarttime, 1, 0)) %>% select(-(CRRTstarttime), -(CRRTendtime)) %>% select(-(ventstart),-(ventend), -(duration))
+
+
+initial_weight <- left_join(icustays, weightdata, by = "stay_id") %>%left_join(CRRTstarttable, by = "hadm_id") %>% filter(!is.na(CRRTstarttime)) %>%
+  group_by(hadm_id) %>% filter(abs(difftime(CRRTstarttime, weighttime, units = "hours")) == min(abs(difftime(CRRTstarttime, weighttime, units = "hours")))) %>% select(hadm_id, weight) %>% group_by(hadm_id) %>% summarize(weight = mean(weight))
+names(initial_weight)[names(initial_weight) == "weight"] <- "startweight"
+
+final_weight <- left_join(icustays, weightdata, by = "stay_id") %>%left_join(CRRTstarttable, by = "hadm_id") %>% filter(!is.na(CRRTstarttime)) %>%
+  group_by(hadm_id) %>% filter(abs(difftime(CRRTendtime, weighttime, units = "hours")) == min(abs(difftime(CRRTendtime, weighttime, units = "hours"))))%>% select(hadm_id, weight) %>% group_by(hadm_id) %>% summarize(weight = mean(weight))
+names(final_weight)[names(final_weight) == "weight"] <- "endweight"
+
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.align = 'left'}
+
+binomial_smooth <- function(...) {
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), ...)
+}
+
+mean_sofa <- left_join(CRRTstarttable, icustays, by = "hadm_id")  %>% left_join(sofa, by = "stay_id") %>% group_by(hadm_id) %>% filter(sofatime>=CRRTstarttime, sofatime <=CRRTendtime) %>% group_by(hadm_id) %>% summarize(MeanSofa = mean(sofa_24hours)) 
+
+#combining derived tables
+icustays_filtered <- left_join(CRRTstarttable, icustays, by = "hadm_id") %>% filter(intime <= CRRTstarttime & outtime >= CRRTendtime)%>% left_join(sofa, by = "stay_id")%>% group_by(hadm_id) %>% filter(sofatime<=CRRTstarttime) %>% filter(sofatime == max(sofatime)) %>% select(hadm_id, stay_id, sofa_24hours, respiration_24hours, coagulation_24hours, liver_24hours, cardiovascular_24hours, cns_24hours, renal_24hours, intime, outtime) %>% left_join(mean_sofa, by = "hadm_id") 
+
+#Comprehensive table
+compa <- left_join(sql_hadmid, sql_core, by = "hadm_id") %>% left_join(icustays_filtered, by = "hadm_id")%>% left_join(sql_patients, by = "subject_id") %>% left_join(icdtable, by = "hadm_id") %>% filter(hadm_id %in% sql_hadmid_filtered$hadm_id) %>% left_join(labtable_melt, by = "hadm_id") %>% left_join(UF_summary, by = "hadm_id") %>% left_join(output_summary, by = "hadm_id")%>% left_join(input_summary, by = "hadm_id") %>%left_join(CRRTstarttable, by = "hadm_id")%>% mutate(duration = as.numeric(difftime(CRRTendtime, CRRTstarttime, units = "hours"))) %>% left_join(MAPtable_comp, by = "hadm_id") %>% left_join(vitalstable, by = "hadm_id") %>% left_join(patient_table_pressors, by = "hadm_id") %>% left_join(venttable) %>% mutate(LDHhigh = ifelse(LDH >LDHlimit,1,0), timesinceicu = as.numeric(difftime(CRRTstarttime, intime, units = "hours")), CRRT_to_icudischarge = as.numeric(difftime(outtime, CRRTstarttime, units = "hours"))) %>% mutate(LDHtext = ifelse(LDH>LDHlimit, as.character(paste("LDH > ",LDHlimit)),as.character(paste("LDH < ", LDHlimit)))) %>% left_join(pre_CRRT_input, by = "hadm_id")%>% left_join(pre_CRRT_output, by = "hadm_id") %>% mutate(preCRRTnetvol = preCRRTinput-preCRRToutput)%>% filter(!is.na(sofa_24hours))%>% left_join(last_CRRT_time, by = "hadm_id") %>% left_join(last_Creatinine, by = "hadm_id") %>% mutate(ethnicityplaceholder = 0, lastGFR = CKDEpi.creat(lastCreatinine,ifelse(gender == "F",0,1),anchor_age,ethnicityplaceholder)) %>% mutate(GFRrecovery = ifelse(lastGFR >= GFRlimit, 1,0)*ifelse(hospital_expire_flag == 1, 0, 1)) %>% mutate(onbroadabx = ifelse(hadm_id %in% broadabxlist$hadm_id,TRUE,FALSE)) %>% mutate(onsteroids = ifelse(hadm_id %in% steroidslist$hadm_id,TRUE,FALSE))%>% group_by(subject_id) %>% filter(CRRTstarttime == min(CRRTstarttime)) %>% left_join(replacementfluid_summary, by = "hadm_id") %>% left_join(initial_weight, by = "hadm_id")%>% left_join(final_weight, by = "hadm_id") %>% mutate(weightchange = endweight-startweight) %>% filter(!is.na(sofa_24hours)) %>% mutate(HasHaptoglobin = ifelse(!is.na(Haptoglobin), 1, 0)) %>% mutate(stratum=ifelse(LDH > 1500,1,0), ESRD = ifelse(!hadm_id %in% ESRD_table$hadm_id,0,1)) %>% group_by(hadm_id) %>% mutate(LDHdiseases = ifelse(metacanc ==1 | lymph == 1 | solidtum == 1, 1, 0)) %>% left_join(UOPtable, by = "hadm_id") %>% mutate(UOPperhour = totalUOP/duration, avginput = totalinput/duration, avgUF = totalUF/duration) %>% filter(avginput <1000)
+
+# %>% filter(hourly_output <=mainrange, hourly_output >0, )
+
+compa$totaloutput[is.na(compa$totaloutput)] = 0
+
+comp <- compa %>% mutate(netoutput = totalUF+totaloutput-totalinput, hourly_output = netoutput/duration)
+
+
+#comp <- readRDS(file = "comp.rds") %>% mutate(ESRD = ifelse(!hadm_id %in% ESRD_table$hadm_id,0,1))
+
+#Race categories
+Races <- c("Asian","Black","Hispanic/Latino","Caucasian")
+
+comp$ethnicity[comp$ethnicity == "ASIAN"] <- "Asian"
+comp$ethnicity[comp$ethnicity == "ASIAN - ASIAN INDIAN"] <- "Asian"
+comp$ethnicity[comp$ethnicity == "ASIAN - CAMBODIAN"] <- "Asian"
+comp$ethnicity[comp$ethnicity == "ASIAN - CHINESE"] <- "Asian"
+comp$ethnicity[comp$ethnicity == "ASIAN - VIETNAMESE"] <- "Asian"
+comp$ethnicity[comp$ethnicity == "ASIAN - OTHER"] <- "Asian"
+
+comp$ethnicity[comp$ethnicity == "BLACK/AFRICAN"] <- "Black"
+comp$ethnicity[comp$ethnicity == "BLACK/AFRICAN AMERICAN"] <- "Black"
+comp$ethnicity[comp$ethnicity == "BLACK/HAITIAN"] <- "Black"
+comp$ethnicity[comp$ethnicity == "BLACK/CAPE VERDEAN"] <- "Black"
+
+comp$ethnicity[comp$ethnicity == "HISPANIC OR LATINO"] <- "Hispanic/Latino"
+comp$ethnicity[comp$ethnicity == "HISPANIC/LATINO"] <- "Hispanic/Latino"
+comp$ethnicity[comp$ethnicity == "HISPANIC/LATINO - GUATEMALAN"] <- "Hispanic/Latino"
+comp$ethnicity[comp$ethnicity == "HISPANIC/LATINO - HONDURAN"] <- "Hispanic/Latino"
+comp$ethnicity[comp$ethnicity == "HISPANIC/LATINO - PUERTO RICAN"] <- "Hispanic/Latino"
+comp$ethnicity[comp$ethnicity == "HISPANIC/LATINO - DOMINICAN"] <- "Hispanic/Latino"
+
+comp$ethnicity[comp$ethnicity == "WHITE"] <- "Caucasian"
+comp$ethnicity[comp$ethnicity == "WHITE - RUSSIAN"] <- "Caucasian"
+
+comp$ethnicity[!comp$ethnicity %in% Races] <- "Other/Unknown/Multiple"
+
+
+comp$LDHtext[is.na(comp$LDHtext)] = as.character("No Recent LDH Value")
+
+
+names(comp)[names(comp) == "sofa_24hours"] = "StartSofa"
+
+var_label(comp$anchor_age) <- "Age"
+var_label(comp$gender) <- "Male"
+var_label(comp$ethnicity) <- "Ethnicity"
+var_label(comp$hospital_expire_flag) <- "Deaths (%)"
+var_label(comp$score) <- "Elixhauser Score"
+var_label(comp$ld) <- "Liver Disease"
+var_label(comp$carit) <- "Cardiac Arrhythmia"
+var_label(comp$wloss) <- "Weight Loss"
+var_label(comp$MAPAUC) <- "Average MAP (mmHg)"
+var_label(comp$vented) <- "Intubated at CRRT Start (%)"
+var_label(comp$StartSofa) <- "Initial SOFA Score"
+var_label(comp$MeanSofa) <- "Mean SOFA Score"
+var_label(comp$timesinceicu) <- "Time Since ICU Admission (hours)"
+var_label(comp$duration) <- "CRRT Duration (hours)"
+var_label(comp$preCRRTnetvol) <- "Fluids Before CRRT (mL)"
+var_label(comp$hourly_output) <- "Average Hourly Output (mL/hour)"
+var_label(comp$replacementfluid_rate) <- "Average Replacement Rate (mL/hr)"
+var_label(comp$avg_norepi) <- "Average Norepinephrine Rate (mcg/kg/min)"
+var_label(comp$avg_epi) <- "Average Epinephrine Rate (mcg/kg/min)"
+var_label(comp$avg_Vasopressin) <- "Average Vasopressin Rate (U/hr)"
+var_label(comp$avg_Phenylephrine) <- "Average Phenylephrine Rate (mcg/kg/min)"
+var_label(comp$avg_Dopamine) <- "Average Dopamine Rate (mcg/kg/min)"
+var_label(comp$avg_Dobutamine) <- "Average Dobutamine Rate (mcg/kg/min)"
+var_label(comp$avg_Milrinone) <- "Average Milrinone Rate (mcg/kg/min)"
+var_label(comp$startweight) <- "Initial Weight (kg)"
+var_label(comp$endweight) <- "Final Weight (kg)"
+var_label(comp$weightchange) <- "Weight Change (kg)"
+var_label(comp$TBilirubin) <- "Total Bilirubin"
+var_label(comp$GFRrecovery) <- "Final eGFR >30 mL/min/1.73 m^2 (%)"
+
+var_label(comp$chf) <- "Congestive Heart Failure"
+var_label(comp$carit) <- "Cardiac Arrhythmia"
+var_label(comp$valv) <- "Valvular Disease"
+var_label(comp$pcd) <- "Pulmonary Circulation Disorders"
+var_label(comp$pvd) <- "Peripheral Vascular Disorders"
+var_label(comp$hypunc) <- "Uncomplicated Hypertension"
+var_label(comp$hypc) <- "Complicated Hypertension"
+var_label(comp$para) <- "Paralysis"
+var_label(comp$ond) <- "Other Neurological Disorders"
+var_label(comp$cpd) <- "Chronic Pulmonary Disease"
+var_label(comp$diabunc) <- "Uncomplicated Diabetes"
+var_label(comp$diabc) <- "Complicated Diabetes"
+var_label(comp$hypothy) <- "Hypothyroidism"
+var_label(comp$rf) <- "Renal Failure"
+var_label(comp$ld) <- "Liver Disease"
+var_label(comp$pud) <- "Peptic Ulcer Disease, Nonbleeding"
+var_label(comp$aids) <- "HIV/AIDS"
+var_label(comp$lymph) <- "Lymphoma"
+var_label(comp$metacanc) <- "Metastatic Cancer"
+var_label(comp$solidtum) <- "Solid Tumor, Nonmetastatic"
+var_label(comp$rheumd) <- "Rheumatoid Arthritis/Collagen Vascular Disease"
+var_label(comp$coag) <- "Coagulopathy"
+var_label(comp$obes) <- "Obesity"
+var_label(comp$wloss) <- "Weight Loss"
+var_label(comp$fed) <- "Fluid and Electrolyte Disorders"
+var_label(comp$blane) <- "Blood Loss Anemia"
+var_label(comp$dane) <- "Deficiency Anemia"
+var_label(comp$alcohol) <- "Alcohol Abuse"
+var_label(comp$drug) <- "Drug Abuse"
+var_label(comp$psycho) <- "Psychoses"
+var_label(comp$depre) <- "Depression"
+var_label(comp$score) <- "Elixhauser Score"
+var_label(comp$ESRD) <- "End Stage Kidney Disease (%)"
+
+var_label(comp$LDH) <- "LDH (IU/L)"
+var_label(comp$Haptoglobin) <- "Haptoglobin (mg/dL)"
+var_label(comp$Lactate) <- "Lactate (mmol/L)"
+var_label(comp$CK) <- "CK (IU/L)"
+var_label(comp$Lipase) <- "Lipase (IU/L)"
+var_label(comp$Sodium) <- "Sodium (mEq/L)"
+var_label(comp$Potassium) <- "Potassium (mEq/L)"
+var_label(comp$Chloride) <- "Chloride (mEq/L)"
+var_label(comp$Bicarbonate) <- "Bicarbonate (mEq/L)"
+var_label(comp$BUN) <- "BUN (mg/dL)"
+var_label(comp$Creatinine) <- "Creatinine (mg/dL)"
+var_label(comp$Calcium) <- "Calcium (mg/dL)"
+var_label(comp$Magnesium) <- "Magnesium (mg/dL)"
+var_label(comp$Phosphorus) <- "Phosphorus (mg/dL)"
+var_label(comp$AST) <- "AST (IU/L)"
+var_label(comp$ALT) <- "ALT (IU/L)"
+var_label(comp$AlkPhos) <- "Alkaline Phosphatase (IU/L)"
+var_label(comp$TBilirubin) <- "Total Bilirubin (mg/dL)"
+var_label(comp$Albumin) <- "Albumin (g/dL)"
+var_label(comp$WBC) <- "White Blood Cells (K/uL)"
+var_label(comp$Hemoglobin) <- "Hemoglobin (g/dL)"
+var_label(comp$Platelets) <- "Platelets (K/uL)"
+var_label(comp$RDW) <- "RDW (%)"
+var_label(comp$Reticulocytes) <- "Reticulocytes, Abs (m/uL)"
+var_label(comp$totalUOP) <- "Total Urine Output (mL)"
+var_label(comp$UOPperhour) <- "Urine Output per hour (mL)"
+
+
+
+comp$avg_norepi[is.na(comp$avg_norepi)] = 0
+comp$avg_epi[is.na(comp$avg_epi)] = 0
+comp$avg_Phenylephrine[is.na(comp$avg_Phenylephrine)] = 0
+comp$avg_Dopamine[is.na(comp$avg_Dopamine)] = 0
+comp$avg_Dobutamine[is.na(comp$avg_Dobutamine)] = 0
+comp$avg_Milrinone[is.na(comp$avg_Milrinone)] = 0
+comp$avg_Vasopressin[is.na(comp$avg_Vasopressin)] = 0
+
+
+comp$max_norepi[is.na(comp$max_norepi)] = 0
+comp$max_epi[is.na(comp$max_epi)] = 0
+comp$max_Phenylephrine[is.na(comp$max_Phenylephrine)] = 0
+comp$max_Dopamine[is.na(comp$max_Dopamine)] = 0
+comp$max_Dobutamine[is.na(comp$max_Dobutamine)] = 0
+comp$max_Milrinone[is.na(comp$max_Milrinone)] = 0
+comp$max_Vasopressin[is.na(comp$max_Vasopressin)] = 0
+
+comp$UOPperhour[is.na(comp$UOPperhour)] = 0
+comp$totalUOP[is.na(comp$totalUOP)] = 0
+
+
+
+
+comp2 <- comp
+#comp2$LDH[is.na(comp2$LDH)] = 0
+comp2$stratum[is.na(comp2$stratum)] = 2
+
+
+# Filtered tables by hourly output in specified range, necessary lab values, ESRD status
+comp_filtered <- comp %>% filter(!is.na(LDH), !is.na(TBilirubin)) 
+                                 #hourly_output <=mainrange, hourly_output >0)
+comp_filtered2 <- comp2 %>% filter(!is.na(TBilirubin))
+                                   
+                                   #, hourly_output <=mainrange, hourly_output >0)
+
+comp_filtered_survived <- comp_filtered %>% filter(hospital_expire_flag == 0)
+comp_filtered_survived_noesrd <- comp_filtered %>% filter(hospital_expire_flag == 0,!hadm_id %in% ESRD_table$hadm_id)
+
+
+
+# Regressions
+
+#Hourly output and mortality
+output_mortality_raw<- glm(hospital_expire_flag~hourly_output, data = comp_filtered, family = "binomial")
+output_mortality <- output_mortality_raw %>% summary()
+
+
+#1500 raw
+reg_1500uni_raw<- glm(hospital_expire_flag~anchor_age+hourly_output*I(stratum == 1), data = comp_filtered, family = "binomial")
+reg_1500uni <- reg_1500uni_raw %>% summary()
+
+#1500 with SOFA components
+reg_1500SOFA_raw<- glm(hospital_expire_flag~anchor_age+hourly_output*I(stratum == 1)+cardiovascular_24hours+renal_24hours+respiration_24hours+liver_24hours+coagulation_24hours+cns_24hours+UOPperhour, data = comp_filtered, family = "binomial")
+reg_1500SOFA <- reg_1500SOFA_raw %>% summary()
+
+#1500 with SOFA liver/cardiovascular
+reg_1500SOFAliver_raw<- glm(hospital_expire_flag~anchor_age+hourly_output*I(stratum == 1)+cardiovascular_24hours+liver_24hours+UOPperhour, data = comp_filtered, family = "binomial")
+reg_1500SOFAliver <- reg_1500SOFAliver_raw %>% summary()
+
+#1500 with TBili/vasopressin/norepi
+reg_1500bili_raw<- glm(hospital_expire_flag~anchor_age+hourly_output*I(stratum == 1)+avg_norepi+avg_Vasopressin+TBilirubin+UOPperhour+Hemoglobin, data = comp_filtered, family = "binomial")
+reg_1500bili <- reg_1500bili_raw %>% summary()
+
+#1500 with TBili/vasopressin/norepi - include NAs
+reg_1500bili_raw_nas<- glm(hospital_expire_flag~anchor_age+hourly_output*I(stratum == 1)+avg_norepi+avg_Vasopressin+TBilirubin+UOPperhour+Hemoglobin, data = comp_filtered2, family = "binomial")
+reg_1500bili_nas <- reg_1500bili_raw_nas %>% summary()
+
+
+
+# LDH vs. hourly output
+LDH_hourly_output_regression_raw = lm(hourly_output~LDH, data= comp_filtered)
+LDH_hourly_output_regression <- LDH_hourly_output_regression_raw %>% summary()
+
+#LDH vs. mortality
+LDH_mortality_regression_raw = glm(hospital_expire_flag~(LDH), data= comp_filtered, family = "binomial")
+LDH_mortality_regression <- LDH_mortality_regression_raw %>% summary()
+
+
+#Table 4: Main regressions
+stargazertable2 <- modelsummary(exponentiate = TRUE,list(output_mortality_raw, reg_1500uni_raw, reg_1500SOFA_raw,reg_1500SOFAliver_raw, reg_1500bili_raw, reg_1500bili_raw_nas), coef_map = c("LDH" = "LDH", "hourly_output"="Hourly Output (mL/hr)", "cardiovascular_24hours" = "SOFA - Cardiovascular", "respiration_24hours" = "SOFA - Respiration","renal_24hours" = "SOFA - Renal","liver_24hours" = "SOFA - Liver","cns_24hours" = "SOFA - CNS","coagulation_24hours" = "SOFA - Coagulation","TBilirubin" = "Total Bilirubin (mg/dL)","Hemoglobin"="Hemoglobin (g/dL)", "avg_norepi" = "Average Norepinephrine (mcg/min)", "avg_Vasopressin" = "Average Vasopressin (U/hr)","anchor_age" = "Patient Age (per year)", "UOPperhour" = "Hourly Urine Output", "I(stratum == 1)TRUE"="LDH > 1500 IU/L", "hourly_output:I(stratum == 1)TRUE"="Interaction LDH > 1500 IU/L:Output (mL/hr)"), output = "latex", gof_omit = 'DF|Deviance|R2|Log.Lik.|F', estimate = "{estimate} \n[{conf.low}, {conf.high}]", statistic = "p{ifelse(p.value <0.001, '<', '=')}{ifelse(p.value <0.001, '0.001', p.value)}{stars}", coef_omit="(Intercept)", font_size = 10, booktabs = TRUE, stars = FALSE, factor = FALSE, caption = "Table 4: Summary of logistic regressions with mortality outcome as functions of SOFA scores, bilirubin levels, vasopressor rates, patient age, and LDH stratum interaction with fluid removal rates with LDH-missing group added in Model 6") %>% kable_styling(latex_options=c("scale_down")) %>% kableExtra::landscape()
+
+
+
+# Appendix A: Plot of LDH vs. hourly output
+LDH_output_plot <- comp_filtered %>% filter(hourly_output <1000) %>% ggplot(aes(x = LDH, y = hourly_output))+geom_point()+theme_classic()+theme(legend.position = "none", plot.caption=element_text(hjust = 0))+xlab("LDH (IU/L, log-transformed)")+ylab("Hourly Output (mL/hour)")+scale_x_log10(breaks = 10^(0:4))+geom_smooth(method="lm", se = FALSE)+labs(caption = "Appendix A: There is no association between LDH and average hourly output, p = 0.783.")+stat_regline_equation(aes(label = ..rr.label..))
+
+#lm(hourly_output~log(LDH), data = comp_filtered) %>% summary()
+
+#Mortality vs. LDH
+#Mortality vs. LDH
+mortality_LDH_plot <- comp_filtered %>% ggplot(aes(y=hospital_expire_flag, x = LDH))+binomial_smooth(se = TRUE)+xlab("LDH (IU/L, log-transformed)")+ylab("Mortality Rate")+theme_classic()+theme(legend.position = "none", plot.caption=element_text(hjust = 0))+geom_rug()+labs(caption = "Mortality rates by LDH on a log-transformed continuous scale with binomial smoothing, p = 0.444.")+scale_x_log10(breaks = 10^(0:4))
+
+
+labels <- data.frame(stratum = c(1,0, 2), x = c(350,500, 650), y = c(.1,.2, .15), LDHtext = c(paste("LDH > ",LDHlimit_high, " IU/L"),paste("LDH ", "<=", " ", LDHlimit_high, " IU/L"), "No LDH Value"))
+
+
+#Figure 2: Mortality vs. hourly_output
+mortality_output_plot <- comp_filtered2 %>%
+  ggplot(aes(y=hospital_expire_flag, x = (avgUF-avginput), color = factor((stratum))))+binomial_smooth(se = TRUE)+xlab("Hourly Output (mL/hour)")+ylab("Mortality Rate")+ geom_text(data = labels, aes(x, y, label = LDHtext, color = factor(stratum)), size = 3)+theme_classic()+theme(legend.position = "none", plot.caption=element_text(hjust = 0))+labs(caption = ("Figure 2: Mortality rates by hourly fluid removal, stratified by LDH level with binomial smoothing. Difference \nin mortality at higher fluid removal rates reflects interaction between LDH stratum and hourly fluid removal, \nadjusted p = 0.045."))
+
+
+#Supplementary figure 1: Mortality and LDH
+mortality_logLDH_plot <- comp_filtered %>% ggplot(aes(y=hospital_expire_flag, x = log(LDH))) +binomial_smooth(se = TRUE)+xlab("LDH")+ylab("Mortality Rate")+labs(caption = ("Supplementary Figure 1: Association between log-transformed LDH values and hourly output."))
+
+
+
+
+
+summarytable1 <- comp_filtered %>% group_by(factor(LDHtext)) %>% summarize(LDH = signif(mean(LDH), digits = 2))
+
+#Tables 1-3
+vars <- c("anchor_age","gender", "ethnicity", "ESRD","score","vented", "StartSofa", "timesinceicu", "preCRRTnetvol","startweight", "LDH","Haptoglobin","Lactate","CK", "Lipase","Sodium","Potassium","Chloride","Bicarbonate","BUN","Creatinine","Calcium","Magnesium","Phosphorus","AST","ALT","AlkPhos","TBilirubin","Albumin","WBC","Hemoglobin","Platelets","RDW", "Reticulocytes")
+
+normalvars <- c("anchor_age","score", "ld","carit","valv","wloss","MAPAUC","StartSofa","duration","avg_norepi","avg_epi","avg_Vasopressin","avg_Phenylephrine","avg_Dopamine","avg_Dobutamine","avg_Milrinone","startweight","endweight","weightchange")
+
+nonnormalvars <- c("preCRRTnetvol","timesinceicu","hourly_output", "replacementfluid_rate", "LDH","Haptoglobin","Lactate","CK", "Lipase","Sodium","Potassium","Chloride","Bicarbonate","BUN","Creatinine","Calcium","Magnesium","Phosphorus","AST","ALT","AlkPhos","TBilirubin","Albumin","WBC","Hemoglobin","Platelets", "RDW", "Reticulocytes")
+
+
+
+catVars <- c("gender", "ethnicity","vented", "ESRD")
+catVars3 <- c("chf","carit","valv","pcd","pvd","hypunc","hypc","para","ond","cpd","diabunc","diabc","hypothy","rf","ld","pud","aids","lymph","metacanc","solidtum","rheumd","coag","obes","wloss","fed","blane","dane","alcohol","drugs","psycho","depre")
+catVars4 <- c("hospital_expire_flag","GFRrecovery")
+
+
+vars2 <- c("hospital_expire_flag", "MAPAUC","duration","hourly_output", "replacementfluid_rate","avg_norepi","avg_epi","avg_Vasopressin","avg_Phenylephrine","avg_Dopamine","avg_Dobutamine","avg_Milrinone","endweight","weightchange", "GFRrecovery", "totalUOP", "UOPperhour")
+
+normalvars2 <- c("MAPAUC","duration","avg_norepi","avg_epi","avg_Vasopressin","avg_Phenylephrine","avg_Dopamine","avg_Dobutamine","avg_Milrinone","startweight", "totalUOP", "UOPperhour")
+
+nonnormalvars2 <- c("hourly_output", "replacementfluid_rate", "Reticulocytes")
+
+
+vars3 <- c("MAPAUC","duration","hourly_output", "replacementfluid_rate","avg_norepi","avg_epi","avg_Vasopressin","avg_Phenylephrine","avg_Dopamine","avg_Dobutamine","avg_Milrinone","endweight","weightchange")
+
+
+
+
+tableOne <- CreateTableOne(vars= vars, factorVars = catVars, strata = c("stratum"), data = comp_filtered2, testNonNormal = kruskal.test) 
+
+p <- print(tableOne, nonnormal = nonnormalvars, exact = normalvars, minMax = FALSE, explain = FALSE, printToggle = FALSE, noSpaces = TRUE, varLabels = TRUE, contDigits = 1, catDigits = 1)%>% data.frame()%>% select(-test, -p) 
+colnames(p) <- (c("LDH $\\le$ 1500 IU/L","LDH > 1500 IU/L", "No LDH Value"))
+
+
+
+mytable1 <- p %>% knitr::kable(col.names = c("LDH <= 1500 IU/L","LDH > 1500 IU/L", "No LDH Value"), format = "latex", caption = "Table 1: Baseline clinical characteristics of subjects, by LDH stratum.", booktabs = TRUE) %>%
+  kable_styling(latex_options=c("scale_down"), font_size = 10) %>%
+  add_indent(c(5,6,7,8,9), level_of_indent = 1) %>% add_footnote(label = "Median [25th %ile, 75th %ile] for laboratory values and flow rates; Mean (SD) for other continuous variables.")
+
+
+outcomestable <- CreateTableOne(vars= vars2, factorVars = catVars4, strata = c("stratum"),  data = comp_filtered2, testNonNormal = kruskal.test) 
+p2 <- print(outcomestable, factorVars = catVars4, minMax = TRUE, nonnormal = nonnormalvars2, exact = normalvars2, explain = FALSE, printToggle = FALSE, noSpaces = TRUE, varLabels = TRUE, contDigits = 1, catDigits = 1)%>% data.frame()%>% select(-test, -p) 
+#colnames(p2) <- (c("LDH <= 1500 IU/L","LDH > 1500 IU/L", "No LDH Value"))
+mytable2 <- p2 %>% knitr::kable(col.names = c("LDH <= 1500 IU/L","LDH > 1500 IU/L", "No LDH Value"),  format = "latex", booktabs = TRUE, caption = "Table 3: CRRT session statistics and outcomes, by LDH stratum.") %>% kable_styling(latex_options=c("scale_down"), font_size = 10) %>% add_footnote(label = "Median [25th %ile, 75th %ile] for CRRT parameters and flow rates; Mean (SD) for other continuous variables.")
+
+
+elixhausertable <- CreateTableOne(vars= catVars3, factorVars = catVars3, strata = "stratum",  data = comp_filtered2, testNonNormal = kruskal.test) 
+p3 <- print(elixhausertable, printToggle = FALSE, minMax = TRUE, noSpaces = TRUE, varLabels = TRUE, contDigits = 1, catDigits = 1)%>% data.frame()%>% select(-test, -p) 
+#colnames(p3) <- (c("LDH <= 1500 IU/L","LDH > 1500 IU/L", "No LDH Value"))
+mytable3 <- p3 %>% knitr::kable(col.names = c("LDH <= 1500 IU/L","LDH > 1500 IU/L", "No LDH Value"),  format = "latex", booktabs = TRUE, caption = "Table 2: Elixhauser diagnoses, by LDH stratum") %>% kable_styling(latex_options=c("scale_down"))
+
+
+
+#Stratified by Mortality (Supplements)
+tableOne_mortality <- CreateTableOne(vars= vars, factorVars = catVars, strata = c("hospital_expire_flag"),  data = comp_filtered2, testNonNormal = kruskal.test) 
+p_mortality <- print(tableOne_mortality, minMax = TRUE, explain = FALSE, nonnormal = nonnormalvars, exact = normalvars, printToggle = FALSE, noSpaces = TRUE, varLabels = TRUE, contDigits = 1, catDigits = 1)%>% data.frame()%>% select(-test, -p) 
+colnames(p_mortality) <- (c("Survived","Died"))
+mytable1_mortality <- kable(p_mortality, format = "latex", caption = "Appendix B: Baseline clinical characteristics of subjects, by mortality outcome.", booktabs = T) %>% kable_styling(latex_options=c("scale_down"), font_size = 10) %>%
+  add_indent(c(5,6,7,8,9), level_of_indent = 1) %>% add_footnote(label = "Median [25th %ile, 75th %ile] for laboratory values and flow rates; Mean (SD) for other continuous variables.")
+
+outcomestable_mortality <- CreateTableOne(vars= vars3, strata = c("hospital_expire_flag"),  data = comp_filtered2, testNonNormal = kruskal.test) 
+p2_mortality <- print(outcomestable_mortality, minMax = TRUE, nonnormal = nonnormalvars2, explain = FALSE, exact = normalvars2, printToggle = FALSE, noSpaces = TRUE, varLabels = TRUE, contDigits = 1, catDigits = 1)%>% data.frame()%>% select(-test, -p) 
+colnames(p2_mortality) <- c("Survived","Died")
+mytable2_mortality <- kable(p2_mortality, format = "latex", booktabs = T, caption = "Appendix D: CRRT session statistics and outcomes, by mortality outcome.") %>% kable_styling(latex_options=c("scale_down"), font_size = 10) %>% add_footnote(label = "Median [25th %ile, 75th %ile] for CRRT parameters and flow rates; Mean (SD) for other continuous variables.")
+
+elixhausertable_mortality <- CreateTableOne(vars= catVars3,factorVars = catVars3, strata = "hospital_expire_flag",  data = comp_filtered2, testNonNormal = kruskal.test) 
+p3_mortality <- print(elixhausertable_mortality, minMax = TRUE, printToggle = FALSE, noSpaces = TRUE, varLabels = TRUE, contDigits = 1, catDigits = 1)%>% data.frame()%>% select(-test, -p) 
+colnames(p3_mortality) <- c("Survived","Died")
+mytable3_mortality <- kable(p3_mortality, format = "latex", caption = "Appendix C: Elixhauser diagnoses, by mortality outcome.", booktabs = T) 
+
+
+
+
+
+
+#Other regressions:
+#LDH vs. mortality
+LDH_mortality_raw <- glm(hospital_expire_flag~LDH, data= comp_filtered, family = "binomial")
+LDH_mortality<- LDH_mortality_raw %>% summary()
+
+
+```
+
+
+
+
+
+
+
+
